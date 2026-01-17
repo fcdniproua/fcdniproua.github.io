@@ -5,7 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BlaBlaCar Widget</title>
 
-<!-- Стилі віджета точно як в оригіналі -->
+<!-- Content Security Policy для дозволу HTTPS контенту -->
+<meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+
+<!-- Стилі віджета -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/3.1.1/css/bootstrap.min.css" crossorigin="anonymous">
 <link rel="stylesheet" href="https://ims.blablacar.pro/white-label/widget/assets/css/app.css" media="all">
 <link rel="stylesheet" href="https://ims.blablacar.pro/white-label/widget/assets/print.css" media="print">
@@ -28,16 +31,26 @@ html, body {
     box-sizing: border-box;
 }
 
-/* Фікс для правильного відображення віджета */
 .container, .container-fluid {
     height: auto !important;
     min-height: auto !important;
 }
 
-/* Забезпечуємо правильне відображення модальних вікон */
-.modal, .popup, .overlay {
+/* Забезпечуємо правильне відображення модальних вікон та LiqPay */
+.modal, .popup, .overlay, iframe[src*="liqpay"] {
     position: fixed !important;
     z-index: 9999 !important;
+}
+
+/* Стилі для LiqPay iframe */
+iframe[src*="liqpay"] {
+    border: none !important;
+    width: 100% !important;
+    max-width: 600px !important;
+    height: 600px !important;
+    top: 50% !important;
+    left: 50% !important;
+    transform: translate(-50%, -50%) !important;
 }
 
 /* Індикатор обробки платежу */
@@ -52,6 +65,7 @@ html, body {
     font-size: 14px;
     z-index: 10000;
     display: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
 }
 
 .payment-success {
@@ -61,16 +75,40 @@ html, body {
 .payment-error {
     background: #dc3545 !important;
 }
+
+.payment-warning {
+    background: #ffc107 !important;
+    color: #000 !important;
+}
+
+/* Overlay для 3DS */
+.payment-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 9998;
+}
+
+.payment-overlay.active {
+    display: block;
+}
 </style>
 </head>
 <body>
+
+<!-- Overlay для 3DS -->
+<div id="payment-overlay" class="payment-overlay"></div>
 
 <!-- Індикатор статусу платежу -->
 <div id="payment-status" class="payment-processing">
     <span id="payment-message">Обробка платежу...</span>
 </div>
 
-<!-- Оригінальний блок віджета без змін -->
+<!-- Віджет -->
 <div id="app" 
      data-spa="1" 
      data-ptoken="f5059429-7229-40e7-a2c4-feb24471e21d" 
@@ -85,41 +123,7 @@ let isWidgetLoaded = false;
 let paymentInProgress = false;
 let paymentStatusChecker = null;
 let lastPaymentTimestamp = 0;
-
-// GitHub Pages SPA fallback - обробка URL з hash
-function handleGitHubPagesSPA() {
-    const hash = window.location.hash;
-    const pathname = window.location.pathname;
-    
-    console.log('Current URL:', window.location.href);
-    console.log('Hash:', hash);
-    console.log('Pathname:', pathname);
-    
-    // Якщо є hash з роутом, витягуємо його
-    if (hash && hash.includes('/')) {
-        const route = hash.substring(1); // Прибираємо #
-        console.log('Extracted route from hash:', route);
-        
-        // Обробляємо роут
-        if (route.includes('/buy/success')) {
-            setTimeout(() => {
-                handleRouteChange('success');
-            }, 1000);
-        } else if (route.includes('/buy/error')) {
-            setTimeout(() => {
-                handleRouteChange('error');
-            }, 1000);
-        } else if (route.includes('/checkout')) {
-            setTimeout(() => {
-                handleRouteChange('checkout');
-            }, 1000);
-        } else if (route.includes('/search')) {
-            setTimeout(() => {
-                handleRouteChange('search');
-            }, 1000);
-        }
-    }
-}
+let liqpayWindow = null;
 
 // Функція для визначення поточного роуту віджета
 function getCurrentRoute() {
@@ -127,17 +131,16 @@ function getCurrentRoute() {
     const path = window.location.pathname;
     const hash = window.location.hash;
     
-    // Перевіряємо всі можливі варіанти роутів
     if (url.includes('/search') || path.includes('/search') || hash.includes('search')) {
         return 'search';
     }
     if (url.includes('/checkout') || path.includes('/checkout') || hash.includes('checkout')) {
         return 'checkout';
     }
-    if (url.includes('/buy/success') || path.includes('/buy/success') || hash.includes('success') || hash.includes('/buy/success')) {
+    if (url.includes('/buy/success') || path.includes('/buy/success') || hash.includes('success')) {
         return 'success';
     }
-    if (url.includes('/buy/error') || path.includes('/buy/error') || hash.includes('error') || hash.includes('/buy/error')) {
+    if (url.includes('/buy/error') || path.includes('/buy/error') || hash.includes('error')) {
         return 'error';
     }
     
@@ -157,11 +160,12 @@ function showPaymentStatus(message, type = 'processing') {
             statusEl.classList.add('payment-success');
         } else if (type === 'error') {
             statusEl.classList.add('payment-error');
+        } else if (type === 'warning') {
+            statusEl.classList.add('payment-warning');
         }
         
         statusEl.style.display = 'block';
         
-        // Автоматично приховуємо через 10 секунд для success/error
         if (type !== 'processing') {
             setTimeout(() => {
                 statusEl.style.display = 'none';
@@ -170,7 +174,7 @@ function showPaymentStatus(message, type = 'processing') {
     }
 }
 
-// Функція для приховування статусу платежу
+// Функція для приховування статусу
 function hidePaymentStatus() {
     const statusEl = document.getElementById('payment-status');
     if (statusEl) {
@@ -178,66 +182,71 @@ function hidePaymentStatus() {
     }
 }
 
-// Функція для збереження статусу платежу в localStorage
-function savePaymentStatus(status, data = {}) {
-    try {
-        localStorage.setItem('blablacar_payment_status', JSON.stringify({
-            status: status,
-            timestamp: Date.now(),
-            data: data,
-            url: window.location.href
-        }));
-    } catch (error) {
-        console.warn('Не вдалося зберегти статус платежу:', error);
+// Показуємо overlay
+function showPaymentOverlay() {
+    const overlay = document.getElementById('payment-overlay');
+    if (overlay) {
+        overlay.classList.add('active');
     }
 }
 
-// Функція для отримання статусу платежу з localStorage
-function getPaymentStatus() {
-    try {
-        const stored = localStorage.getItem('blablacar_payment_status');
-        if (stored) {
-            const parsed = JSON.parse(stored);
-            // Перевіряємо, чи не застарілий статус (більше 10 хвилин)
-            if (Date.now() - parsed.timestamp < 600000) {
-                return parsed;
-            } else {
-                localStorage.removeItem('blablacar_payment_status');
-            }
+// Приховуємо overlay
+function hidePaymentOverlay() {
+    const overlay = document.getElementById('payment-overlay');
+    if (overlay) {
+        overlay.classList.remove('active');
+    }
+}
+
+// Виправлення HTTP на HTTPS для LiqPay
+function fixLiqPayUrls() {
+    // Перехоплюємо всі запити до LiqPay і змінюємо HTTP на HTTPS
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+        if (typeof url === 'string' && url.includes('liqpay.ua')) {
+            url = url.replace('http://', 'https://');
+            console.log('🔧 Виправлено URL LiqPay на HTTPS:', url);
         }
-    } catch (error) {
-        console.warn('Помилка читання статусу платежу:', error);
-    }
-    return null;
-}
-
-// Функція для очищення статусу платежу
-function clearPaymentStatus() {
-    try {
-        localStorage.removeItem('blablacar_payment_status');
-    } catch (error) {
-        console.warn('Помилка очищення статусу платежу:', error);
-    }
+        return originalFetch(url, options);
+    };
+    
+    // Перехоплюємо створення iframe
+    const originalCreateElement = document.createElement;
+    document.createElement = function(tagName) {
+        const element = originalCreateElement.call(document, tagName);
+        
+        if (tagName.toLowerCase() === 'iframe') {
+            const originalSetAttribute = element.setAttribute;
+            element.setAttribute = function(name, value) {
+                if (name === 'src' && typeof value === 'string' && value.includes('liqpay.ua')) {
+                    value = value.replace('http://', 'https://');
+                    console.log('🔧 Виправлено src iframe LiqPay на HTTPS:', value);
+                }
+                return originalSetAttribute.call(this, name, value);
+            };
+        }
+        
+        return element;
+    };
 }
 
 // Детекція початку процесу оплати
 function detectPaymentStart() {
-    // Відстежуємо кліки по кнопках оплати
     document.addEventListener('click', function(event) {
         const target = event.target;
         const isPaymentButton = target && (
-            target.textContent && (
+            (target.textContent && (
                 target.textContent.includes('Оплатити') ||
                 target.textContent.includes('Купити') ||
                 target.textContent.includes('Замовити') ||
                 target.textContent.includes('Pay') ||
                 target.textContent.includes('Buy')
-            ) ||
-            target.className && (
+            )) ||
+            (target.className && (
                 target.className.includes('pay') ||
                 target.className.includes('buy') ||
                 target.className.includes('checkout')
-            ) ||
+            )) ||
             target.closest('[class*="pay"]') ||
             target.closest('[class*="buy"]') ||
             target.closest('[class*="checkout"]')
@@ -247,11 +256,13 @@ function detectPaymentStart() {
             console.log('🔄 Виявлено початок процесу оплати');
             paymentInProgress = true;
             lastPaymentTimestamp = Date.now();
-            savePaymentStatus('processing', { startTime: lastPaymentTimestamp });
             showPaymentStatus('Ініціалізація платежу...', 'processing');
+            showPaymentOverlay();
             
-            // Запускаємо моніторинг статусу
-            startPaymentStatusMonitoring();
+            // Запускаємо моніторинг
+            setTimeout(() => {
+                startPaymentStatusMonitoring();
+            }, 2000);
         }
     }, true);
 }
@@ -263,246 +274,205 @@ function startPaymentStatusMonitoring() {
     }
     
     let checkCount = 0;
-    const maxChecks = 120; // 10 хвилин перевірки
+    const maxChecks = 240; // 20 хвилин перевірки
     
-    showPaymentStatus('Очікування результату 3DS...', 'processing');
+    showPaymentStatus('Очікування платіжної форми...', 'processing');
     
     paymentStatusChecker = setInterval(() => {
         checkCount++;
         
-        // Перевіряємо зміни в URL
+        // Перевіряємо URL
         const currentRoute = getCurrentRoute();
         
         if (currentRoute === 'success') {
-            console.log('✅ Платіж успішний (виявлено по URL)');
+            console.log('✅ Платіж успішний (URL)');
             handlePaymentSuccess({ source: 'url_detection', route: currentRoute });
             clearInterval(paymentStatusChecker);
             return;
         }
         
         if (currentRoute === 'error') {
-            console.log('❌ Платіж неуспішний (виявлено по URL)');
+            console.log('❌ Платіж неуспішний (URL)');
             handlePaymentError({ source: 'url_detection', route: currentRoute });
             clearInterval(paymentStatusChecker);
             return;
         }
         
-        // Перевіряємо наявність елементів успіху/помилки на сторінці
+        // Перевіряємо наявність LiqPay iframe
+        const liqpayIframes = document.querySelectorAll('iframe[src*="liqpay"]');
+        if (liqpayIframes.length > 0) {
+            console.log('💳 Знайдено LiqPay iframe');
+            showPaymentStatus('Завантаження платіжної форми LiqPay...', 'processing');
+        }
+        
+        // Перевіряємо елементи успіху/помилки
         const successElements = document.querySelectorAll('[class*="success"], [class*="complete"], [class*="paid"]');
         const errorElements = document.querySelectorAll('[class*="error"], [class*="fail"], [class*="declined"]');
         
         if (successElements.length > 0) {
-            console.log('✅ Платіж успішний (виявлено по елементам DOM)');
-            handlePaymentSuccess({ source: 'dom_detection', elements: successElements.length });
-            clearInterval(paymentStatusChecker);
-            return;
+            const successText = Array.from(successElements).map(el => el.textContent).join(' ');
+            if (successText.includes('успішно') || successText.includes('success') || successText.includes('complete')) {
+                console.log('✅ Платіж успішний (DOM)');
+                handlePaymentSuccess({ source: 'dom_detection' });
+                clearInterval(paymentStatusChecker);
+                return;
+            }
         }
         
         if (errorElements.length > 0) {
-            console.log('❌ Платіж неуспішний (виявлено по елементам DOM)');
-            handlePaymentError({ source: 'dom_detection', elements: errorElements.length });
-            clearInterval(paymentStatusChecker);
-            return;
+            const errorText = Array.from(errorElements).map(el => el.textContent).join(' ');
+            if (errorText.includes('помилка') || errorText.includes('error') || errorText.includes('fail')) {
+                console.log('❌ Платіж неуспішний (DOM)');
+                handlePaymentError({ source: 'dom_detection' });
+                clearInterval(paymentStatusChecker);
+                return;
+            }
         }
         
-        // Оновлюємо повідомлення кожні 30 секунд
-        if (checkCount % 60 === 0) {
-            const minutes = Math.floor(checkCount / 60);
+        // Оновлюємо повідомлення
+        if (checkCount % 30 === 0) {
+            const minutes = Math.floor(checkCount / 12);
             showPaymentStatus(`Очікування результату... (${minutes} хв)`, 'processing');
         }
         
-        // Зупиняємо після максимальної кількості перевірок
+        // Тайм-аут
         if (checkCount >= maxChecks) {
             console.log('⏰ Тайм-аут моніторингу платежу');
-            showPaymentStatus('Не вдалося визначити статус платежу. Перевірте вашу історію замовлень.', 'error');
+            showPaymentStatus('Час очікування вичерпано. Перевірте статус в особистому кабінеті.', 'warning');
             paymentInProgress = false;
+            hidePaymentOverlay();
             clearInterval(paymentStatusChecker);
         }
-    }, 5000); // Перевіряємо кожні 5 секунд
+    }, 5000);
 }
 
 // Обробка успішного платежу
 function handlePaymentSuccess(data = {}) {
-    console.log('✅ Успішний платіж обробляється:', data);
+    console.log('✅ Успішний платіж:', data);
     
     paymentInProgress = false;
-    savePaymentStatus('success', data);
+    hidePaymentOverlay();
     showPaymentStatus('✅ Платіж успішно завершено!', 'success');
     
-    // Повідомляємо батьківське вікно
     if (window.parent && window.parent !== window) {
         window.parent.postMessage({
             type: 'payment_success',
-            data: { ...data, timestamp: Date.now(), url: window.location.href },
+            data: { ...data, timestamp: Date.now() },
             source: 'blablacar-widget'
         }, '*');
     }
     
-    // Очищуємо статус через 5 секунд
-    setTimeout(() => {
-        clearPaymentStatus();
-    }, 5000);
+    if (paymentStatusChecker) {
+        clearInterval(paymentStatusChecker);
+    }
 }
 
 // Обробка неуспішного платежу
 function handlePaymentError(data = {}) {
-    console.log('❌ Неуспішний платіж обробляється:', data);
+    console.log('❌ Неуспішний платіж:', data);
     
     paymentInProgress = false;
-    savePaymentStatus('error', data);
+    hidePaymentOverlay();
     showPaymentStatus('❌ Платіж не завершено. Спробуйте ще раз.', 'error');
     
-    // Повідомляємо батьківське вікно
     if (window.parent && window.parent !== window) {
         window.parent.postMessage({
             type: 'payment_error',
-            data: { ...data, timestamp: Date.now(), url: window.location.href },
+            data: { ...data, timestamp: Date.now() },
             source: 'blablacar-widget'
         }, '*');
     }
     
-    // Очищуємо статус через 5 секунд
-    setTimeout(() => {
-        clearPaymentStatus();
-    }, 5000);
+    if (paymentStatusChecker) {
+        clearInterval(paymentStatusChecker);
+    }
 }
 
-// Обробка фокусу вікна (повернення з 3DS)
+// Обробка фокусу вікна
 function handleWindowFocus() {
     window.addEventListener('focus', function() {
         if (paymentInProgress) {
-            console.log('🔍 Вікно отримало фокус під час платежу - перевіряємо статус');
+            console.log('🔍 Перевірка статусу після повернення фокусу');
             
-            // Затримка для завантаження контенту після повернення
             setTimeout(() => {
                 const currentRoute = getCurrentRoute();
                 
                 if (currentRoute === 'success') {
-                    handlePaymentSuccess({ source: 'window_focus', route: currentRoute });
+                    handlePaymentSuccess({ source: 'window_focus' });
                 } else if (currentRoute === 'error') {
-                    handlePaymentError({ source: 'window_focus', route: currentRoute });
-                } else {
-                    // Продовжуємо моніторинг
-                    showPaymentStatus('Перевіряємо результат платежу...', 'processing');
+                    handlePaymentError({ source: 'window_focus' });
                 }
             }, 2000);
         }
     });
 }
 
-// Основна функція для відправки висоти батьківському вікну
+// Відправка висоти батьківському вікну
 function sendHeightToParent() {
     try {
-        // Отримуємо всі можливі варіанти висоти
-        const bodyHeight = document.body.scrollHeight;
-        const bodyOffsetHeight = document.body.offsetHeight;
-        const documentHeight = document.documentElement.scrollHeight;
-        const documentOffsetHeight = document.documentElement.offsetHeight;
+        const heights = [
+            document.body.scrollHeight,
+            document.body.offsetHeight,
+            document.documentElement.scrollHeight,
+            document.documentElement.offsetHeight,
+            window.innerHeight
+        ];
+        
         const appElement = document.getElementById('app');
-        const appHeight = appElement ? Math.max(appElement.scrollHeight, appElement.offsetHeight) : 0;
-        const windowHeight = window.innerHeight;
-        
-        // Додаткові перевірки для динамічного контенту
-        const allElements = document.querySelectorAll('*');
-        let maxElementBottom = 0;
-        
-        allElements.forEach(el => {
-            const rect = el.getBoundingClientRect();
-            const elementBottom = rect.bottom + window.pageYOffset;
-            if (elementBottom > maxElementBottom) {
-                maxElementBottom = elementBottom;
-            }
-        });
-        
-        // Вибираємо максимальну висоту з усіх варіантів
-        const calculatedHeight = Math.max(
-            bodyHeight,
-            bodyOffsetHeight,
-            documentHeight,
-            documentOffsetHeight,
-            appHeight,
-            windowHeight,
-            maxElementBottom
-        );
-        
-        // Мінімальна висота залежно від роуту
-        const currentRoute = getCurrentRoute();
-        let minHeight = 400;
-        
-        switch(currentRoute) {
-            case 'search': minHeight = 500; break;
-            case 'checkout': minHeight = 600; break;
-            case 'success': minHeight = 350; break;
-            case 'error': minHeight = 350; break;
-            default: minHeight = 400; break;
+        if (appElement) {
+            heights.push(appElement.scrollHeight, appElement.offsetHeight);
         }
         
-        const finalHeight = Math.max(calculatedHeight, minHeight);
+        const currentRoute = getCurrentRoute();
+        const minHeights = {
+            'search': 500,
+            'checkout': 600,
+            'success': 350,
+            'error': 350,
+            'home': 400
+        };
         
-        // Відправляємо висоту тільки якщо вона змінилась значно
-        if (Math.abs(finalHeight - lastHeight) > 10 || !isWidgetLoaded) {
-            lastHeight = finalHeight;
+        const calculatedHeight = Math.max(...heights, minHeights[currentRoute] || 400);
+        
+        if (Math.abs(calculatedHeight - lastHeight) > 10 || !isWidgetLoaded) {
+            lastHeight = calculatedHeight;
             isWidgetLoaded = true;
             
             if (window.parent && window.parent !== window) {
                 window.parent.postMessage({
                     type: 'iframeResize',
-                    iframeHeight: finalHeight,
+                    iframeHeight: calculatedHeight,
                     route: currentRoute,
                     source: 'blablacar-widget'
                 }, '*');
             }
-            
-            console.log(`Висота оновлена: ${finalHeight}px, Роут: ${currentRoute}`);
         }
-        
     } catch (error) {
-        console.warn('Помилка при відправці висоти:', error);
+        console.warn('Помилка відправки висоти:', error);
     }
 }
 
-// Функція для відстеження змін роуту
+// Відстеження змін роуту
 function trackRouteChanges() {
     let currentRoute = getCurrentRoute();
     
-    // Обробляємо popstate події (кнопки назад/вперед)
-    window.addEventListener('popstate', () => {
-        setTimeout(() => {
-            const newRoute = getCurrentRoute();
-            if (newRoute !== currentRoute) {
-                currentRoute = newRoute;
-                handleRouteChange(newRoute);
-            }
-        }, 100);
-    });
-    
-    // Обробляємо зміни hash
-    window.addEventListener('hashchange', () => {
-        setTimeout(() => {
-            handleGitHubPagesSPA();
-            const newRoute = getCurrentRoute();
-            if (newRoute !== currentRoute) {
-                currentRoute = newRoute;
-                handleRouteChange(newRoute);
-            }
-        }, 100);
-    });
-    
-    // Періодично перевіряємо зміни роуту
-    setInterval(() => {
+    const checkRoute = () => {
         const newRoute = getCurrentRoute();
         if (newRoute !== currentRoute) {
             currentRoute = newRoute;
             handleRouteChange(newRoute);
         }
-    }, 1000);
+    };
+    
+    window.addEventListener('popstate', () => setTimeout(checkRoute, 100));
+    window.addEventListener('hashchange', () => setTimeout(checkRoute, 100));
+    setInterval(checkRoute, 1000);
 }
 
 // Обробка зміни роуту
 function handleRouteChange(route) {
     console.log('Зміна роуту на:', route);
     
-    // Повідомляємо батьківське вікно про зміну роуту  
     if (window.parent && window.parent !== window) {
         window.parent.postMessage({
             type: 'routeChange',
@@ -512,12 +482,9 @@ function handleRouteChange(route) {
         }, '*');
     }
     
-    // Оновлюємо висоту після зміни роуту
     setTimeout(sendHeightToParent, 200);
     setTimeout(sendHeightToParent, 1000);
-    setTimeout(sendHeightToParent, 2000);
     
-    // Обробляємо специфічні роути
     if (route === 'success') {
         handlePaymentSuccess({ route: 'success', source: 'route_change' });
     }
@@ -535,29 +502,25 @@ const observer = new MutationObserver((mutations) => {
         if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
             shouldUpdate = true;
             
-            // Перевіряємо нові елементи на предмет статусу платежу
             mutation.addedNodes.forEach(node => {
-                if (node.nodeType === 1) { // Element node
+                if (node.nodeType === 1) {
                     const text = node.textContent || '';
                     const className = node.className || '';
                     
                     if (paymentInProgress) {
-                        // Детекція успішного платежу
-                        if (text.includes('успішно') || text.includes('оплачено') || text.includes('success') ||
-                            className.includes('success') || className.includes('complete')) {
-                            handlePaymentSuccess({ source: 'dom_mutation', text: text.substring(0, 100) });
+                        if (text.includes('успішно') || text.includes('success') ||
+                            className.includes('success')) {
+                            handlePaymentSuccess({ source: 'dom_mutation' });
                         }
                         
-                        // Детекція помилки платежу
-                        if (text.includes('помилка') || text.includes('error') || text.includes('відхилено') ||
-                            className.includes('error') || className.includes('fail')) {
-                            handlePaymentError({ source: 'dom_mutation', text: text.substring(0, 100) });
+                        if (text.includes('помилка') || text.includes('error') ||
+                            className.includes('error')) {
+                            handlePaymentError({ source: 'dom_mutation' });
                         }
                     }
                 }
             });
-        } else if (mutation.type === 'attributes' && 
-                  ['style', 'class', 'height'].includes(mutation.attributeName)) {
+        } else if (mutation.type === 'attributes') {
             shouldUpdate = true;
         }
     });
@@ -567,51 +530,33 @@ const observer = new MutationObserver((mutations) => {
     }
 });
 
-// Обробка повідомлень від самого віджета BlaBlaCar та LiqPay
+// Обробка повідомлень
 window.addEventListener('message', function(event) {
     try {
-        if (event.data && typeof event.data === 'object') {
-            
-            // Перевіряємо різні типи повідомлень від віджета
-            const data = event.data;
-            
-            // Повідомлення про успішну оплату
-            if (data.type === 'payment_complete' || 
-                data.type === 'purchase_success' ||
-                data.status === 'success' ||
-                data.event === 'payment_success' ||
-                data.action === 'payment_success' ||
-                (data.liqpay && data.liqpay.status === 'success')) {
+        const data = event.data;
+        
+        if (data && typeof data === 'object') {
+            // Повідомлення від LiqPay
+            if (data.liqpay || event.origin.includes('liqpay')) {
+                console.log('💳 Повідомлення від LiqPay:', data);
                 
-                console.log('Отримано повідомлення про успішну оплату:', data);
-                handlePaymentSuccess({ source: 'postmessage', data: data });
-            }
-            
-            // Повідомлення про помилку оплати
-            if (data.type === 'payment_error' || 
-                data.type === 'purchase_error' ||
-                data.status === 'error' ||
-                data.event === 'payment_error' ||
-                data.action === 'payment_error' ||
-                (data.liqpay && data.liqpay.status === 'error')) {
-                
-                console.log('Отримано повідомлення про помилку оплати:', data);
-                handlePaymentError({ source: 'postmessage', data: data });
-            }
-            
-            // LiqPay специфічні повідомлення
-            if (data.liqpay) {
-                console.log('LiqPay повідомлення:', data);
-                
-                if (data.liqpay.action === '3ds_verify') {
+                if (data.status === 'success' || data.action === 'success') {
+                    handlePaymentSuccess({ source: 'liqpay', data });
+                } else if (data.status === 'error' || data.action === 'error') {
+                    handlePaymentError({ source: 'liqpay', data });
+                } else if (data.action === '3ds_verify') {
                     showPaymentStatus('Проходження 3DS перевірки...', 'processing');
                 }
             }
             
-            // Будь-які інші повідомлення від віджета
-            if (data.type && !data.source) {
-                console.log('Повідомлення від віджета:', data);
-                setTimeout(sendHeightToParent, 200);
+            // Повідомлення про успіх
+            if (data.type === 'payment_complete' || data.status === 'success') {
+                handlePaymentSuccess({ source: 'postmessage', data });
+            }
+            
+            // Повідомлення про помилку
+            if (data.type === 'payment_error' || data.status === 'error') {
+                handlePaymentError({ source: 'postmessage', data });
             }
         }
     } catch (error) {
@@ -619,89 +564,20 @@ window.addEventListener('message', function(event) {
     }
 });
 
-// Обробка помилок
-window.addEventListener('error', function(event) {
-    console.warn('Помилка:', event.error);
-    
-    // Базова обробка 404 помилок
-    if (event.message && (
-        event.message.includes('404') || 
-        event.message.includes('Not Found') ||
-        event.message.includes('Cannot GET')
-    )) {
-        console.error('Виявлено 404 помилку:', event.message);
-        
-        if (window.parent && window.parent !== window) {
-            window.parent.postMessage({
-                type: 'navigation_error',
-                error: '404',
-                url: window.location.href,
-                message: event.message,
-                source: 'blablacar-widget'
-            }, '*');
-        }
-    }
-});
-
-// Обробка відхилених промісів
-window.addEventListener('unhandledrejection', function(event) {
-    console.warn('Відхилений проміс:', event.reason);
-    
-    const error = event.reason;
-    if (error && (
-        (typeof error === 'string' && error.includes('404')) ||
-        (error.message && error.message.includes('404')) ||
-        (error.status === 404)
-    )) {
-        console.error('404 в промісі:', error);
-        
-        if (window.parent && window.parent !== window) {
-            window.parent.postMessage({
-                type: 'promise_rejection_404',
-                error: error.toString(),
-                url: window.location.href,
-                source: 'blablacar-widget'
-            }, '*');
-        }
-        
-        event.preventDefault();
-    }
-});
-
-// Функція ініціалізації
+// Ініціалізація
 function initializeWidget() {
-    console.log('Ініціалізація BlaBlaCar віджета...');
-    console.log('Поточний URL:', window.location.href);
+    console.log('🚀 Ініціалізація віджета BlaBlaCar');
+    console.log('📍 URL:', window.location.href);
     
-    // Перевіряємо збережений статус платежу
-    const savedStatus = getPaymentStatus();
-    if (savedStatus) {
-        console.log('Знайдено збережений статус платежу:', savedStatus);
-        
-        if (savedStatus.status === 'processing') {
-            paymentInProgress = true;
-            lastPaymentTimestamp = savedStatus.timestamp;
-            startPaymentStatusMonitoring();
-        } else if (savedStatus.status === 'success') {
-            showPaymentStatus('✅ Останній платіж був успішним', 'success');
-        } else if (savedStatus.status === 'error') {
-            showPaymentStatus('❌ Останній платіж не вдався', 'error');
-        }
-    }
+    // Виправляємо URLs для LiqPay
+    fixLiqPayUrls();
     
-    // Обробляємо GitHub Pages SPA routing
-    handleGitHubPagesSPA();
-    
-    // Запускаємо відстеження змін роуту
+    // Запускаємо всі обробники
     trackRouteChanges();
-    
-    // Запускаємо детекцію початку платежу
     detectPaymentStart();
-    
-    // Запускаємо обробку фокусу вікна
     handleWindowFocus();
     
-    // Запускаємо спостерігач DOM
+    // Спостерігач DOM
     observer.observe(document.body, {
         childList: true,
         subtree: true,
@@ -709,54 +585,38 @@ function initializeWidget() {
         attributeFilter: ['style', 'class', 'height']
     });
     
-    // Інтенсивна перевірка висоти перші 20 секунд
+    // Інтенсивна перевірка висоти
     let checkCount = 0;
-    const maxChecks = 40; // 20 секунд по 500мс
-    
     heightCheckInterval = setInterval(() => {
         sendHeightToParent();
         checkCount++;
         
-        if (checkCount >= maxChecks) {
+        if (checkCount >= 40) {
             clearInterval(heightCheckInterval);
-            // Переходимо на рідшу перевірку кожні 3 секунди
             setInterval(sendHeightToParent, 3000);
         }
     }, 500);
     
-    // Перевіряємо поточний роут
-    setTimeout(() => {
-        handleRouteChange(getCurrentRoute());
-    }, 1000);
+    setTimeout(() => handleRouteChange(getCurrentRoute()), 1000);
 }
 
-// Обробники подій завантаження
-window.addEventListener('load', function() {
-    setTimeout(initializeWidget, 500);
-});
+// Запуск
+window.addEventListener('load', () => setTimeout(initializeWidget, 500));
+window.addEventListener('resize', () => setTimeout(sendHeightToParent, 100));
 
-window.addEventListener('resize', function() {
-    setTimeout(sendHeightToParent, 100);
-});
-
-// Якщо DOM вже готовий
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-        setTimeout(initializeWidget, 200);
-    });
-} else {
+if (document.readyState !== 'loading') {
     setTimeout(initializeWidget, 200);
+} else {
+    document.addEventListener('DOMContentLoaded', () => setTimeout(initializeWidget, 200));
 }
 
-// Відправляємо початкову висоту
 setTimeout(sendHeightToParent, 1000);
-setTimeout(sendHeightToParent, 3000);
 </script>
 
-<!-- Оригінальні скрипти віджета без змін -->
+<!-- Оригінальні скрипти віджета -->
 <script src="https://ims.blablacar.pro/white-label/widget/assets/js/manifest.js"></script>
 <script src="https://ims.blablacar.pro/white-label/widget/assets/js/vendor.js"></script>
 <script src="https://ims.blablacar.pro/white-label/widget/assets/js/app.js"></script>
 
 </body>
-</html> 
+</html>
